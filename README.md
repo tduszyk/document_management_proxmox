@@ -409,3 +409,30 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 ```
+
+Enable and Start Stack
+
+```
+systemctl daemon-reload
+systemctl enable --now paperless-webserver paperless-worker paperless-consumer paperless-scheduler
+```
+
+## 5. Automated Disaster Recovery
+Paperless-ngx includes a native export utility that dumps all metadata, correspondents, document tags, and raw files into an immutable, self-contained archive.
+
+Configure a nightly export on Debian LXC 106:
+
+```
+# Add cron job scheduled for 02:00 nightly
+(crontab -l 2>/dev/null; echo "0 2 * * * cd /opt/paperless/src && sudo -u paperless ../venv/bin/python3 manage.py document_exporter /mnt/export -c > /dev/null 2>&1") | crontab -
+```
+
+## 6. Verification and Daily Workflow
+1. Mount Storage: Open Finder on macOS -> Cmd + K -> smb://192.168.1.108/storage.
+2. Mount Drop Folder: Connect to smb://192.168.1.108/consume.
+3. Ingest Document: Drop any PDF, scan, or TIFF into consume.
+4. Processing Pipeline:
+   a. Samba writes the file with GID 1002.
+   b. paperless-consumer picks up the file within 30 seconds and queues a Celery task.
+   c. paperless-worker extracts text using Tesseract OCR, generates a thumbnail, files the asset into /mnt/media, and clears the drop folder.
+5. Access Dashboard: Review, search, and tag documents via the Web UI at http://192.168.1.109:8000.
