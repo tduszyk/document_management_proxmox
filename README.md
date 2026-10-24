@@ -8,7 +8,7 @@ This guide details migrating legacy file storage and document management from a 
 
                      +---------------------------------------+
                      |       Proxmox VE Host (sulaco)        |
-                     |  - Native ZFS Storage Pool (xxxT)    |
+                     |  - Native ZFS Storage Pool (xxxT)     |
                      |  - Linux VFS Bind Mounts              |
                      +-------------------+-------------------+
                                          |
@@ -75,3 +75,113 @@ zfs create storage/paperless/export
 # Container root (UID 0) maps to host 100000; container group 'backup' (GID 1002) maps to host 101002
 chown -R 100000:101002 /bays/storage
 chmod -R 2775 /bays/storage
+```
+
+## 2. Alpine Samba LXC (Container 105)
+Deploy a lightweight Alpine Linux container to serve SMB shares with macOS Finder optimizations (vfs_fruit).
+
+Container Provisioning
+Execute on the Proxmox host:
+
+```
+# 1. Download the latest Alpine template
+pveam update
+pveam download local alpine-3.24-default_20260714_amd64.tar.xz
+
+# 2. Create unprivileged LXC with identical IP and MAC identity
+pct create 105 local:vztmpl/alpine-3.24-default_20260714_amd64.tar.xz \
+  --hostname storage \
+  --memory 512 \
+  --swap 512 \
+  --cores 1 \
+  --ostype alpine \
+  --unprivileged 1 \
+  --features nesting=1 \
+  --onboot 1 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.1.108/24,gw=192.168.1.1,hwaddr=6a:31:63:16:9a:1f \
+  --rootfs local-lvm:2
+
+# 3. Attach ZFS datasets via bind mount
+pct set 105 -mp0 /bays/storage,mp=/bays/storage
+pct set 105 -mp1 /bays/storage/paperless/consume,mp=/bays/storage/consume
+
+# 4. Start container
+pct start 105
+pct enter 105
+```
+
+Samba Service Configuration
+Execute inside Alpine LXC 105 (storage:~#):
+```
+# 1. Install Samba
+apk update && apk add samba samba-common-tools
+
+# 2. Create group and user matching existing permissions
+addgroup -g 1002 backup
+adduser -D -G backup t
+
+# Set Samba password (use original SMB credentials)
+smbpasswd -a t
+smbpasswd -e t
+
+# 3. Write /etc/samba/smb.conf
+cat << 'EOF' > /etc/samba/smb.conf
+[global]
+    workgroup = WORKGROUP
+    server string = storage
+    netbios name = storage
+    security = user
+    passdb backend = tdbsam
+
+    # Performance & Protocol
+    server min protocol = SMB2_10
+    server max protocol = SMB3
+    use sendfile = yes
+    aio read size = 1
+    aio write size = 1
+
+    # macOS Finder Optimizations (vfs_fruit)
+    vfs objects = fruit streams_xattr
+    fruit:metadata = stream
+    fruit:model = Macmini
+    fruit:posix_rename = yes
+    fruit:veto_appledouble = no
+    fruit:wipe_intentionally_left_blank_rfork = yes
+    fruit:delete_empty_adfiles = yes
+    fruit:encoding = native
+
+[storage]
+    comment = ZFS Shared Storage
+    path = /bays/storage
+    valid users = @backup
+    write list = @backup
+    read only = no
+    browseable = yes
+    guest ok = no
+    force group = backup
+    create mask = 0664
+    force create mode = 0664
+    directory mask = 0775
+    force directory mode = 0775
+    inherit permissions = yes
+
+[consume]
+    comment = Paperless Ingestion Drop
+    path = /bays/storage/consume
+    valid users = @backup
+    write list = @backup
+    read only = no
+    browseable = yes
+    guest ok = no
+    force group = backup
+    create mask = 0664
+    force create mode = 0664
+    directory mask = 0775
+    force directory mode = 0775
+    inherit permissions = yes
+EOF
+
+# 4. Enable and start Samba
+rc-update add samba default
+rc-service samba start
+```
