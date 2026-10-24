@@ -51,7 +51,7 @@ Import the storage pool natively onto the Proxmox host and create dedicated data
 ### Host Storage Setup
 Execute on the **Proxmox host (`sulaco`)**:
 
-```bash
+```
 # 1. Import pool and set stable mountpoint
 zpool import -f storage
 zfs set mountpoint=/bays/storage storage
@@ -112,6 +112,7 @@ pct enter 105
 
 Samba Service Configuration
 Execute inside Alpine LXC 105 (storage:~#):
+
 ```
 # 1. Install Samba
 apk update && apk add samba samba-common-tools
@@ -184,4 +185,227 @@ EOF
 # 4. Enable and start Samba
 rc-update add samba default
 rc-service samba start
+```
+
+## 3. Paperless-ngx Debian LXC (Container 106)
+Deploy a dedicated Debian 12 (Bookworm) container to host the OCR engine, background processing workers, and web interface.
+
+Container Provisioning
+Execute on the Proxmox host:
+
+```
+# 1. Download Debian 12 template
+pveam download local debian-12-standard_12.7-1_amd64.tar.zst
+
+# 2. Create unprivileged LXC
+pct create 106 local:vztmpl/debian-12-standard_12.7-1_amd64.tar.zst \
+  --hostname paperless \
+  --memory 4096 \
+  --swap 2048 \
+  --cores 4 \
+  --ostype debian \
+  --unprivileged 1 \
+  --features nesting=1,keyctl=1 \
+  --onboot 1 \
+  --net0 name=eth0,bridge=vmbr0,ip=192.168.1.109/24,gw=192.168.1.1 \
+  --rootfs local-lvm:16
+
+# 3. Bind mount ZFS datasets to internal paths
+pct set 106 -mp0 /bays/storage/paperless/consume,mp=/mnt/consume
+pct set 106 -mp1 /bays/storage/paperless/media,mp=/mnt/media
+pct set 106 -mp2 /bays/storage/paperless/export,mp=/mnt/export
+
+# 4. Start container
+pct start 106
+pct enter 106
+```
+
+System Locale & Package Setup
+Execute inside Debian LXC 106 (paperless:~#):
+
+```
+# 1. Configure UTF-8 system locales (Critical for PostgreSQL and Python OCR)
+apt update && apt install -y locales
+echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
+locale-gen
+update-locale LANG=en_US.UTF-8
+export LANG=en_US.UTF-8
+
+# 2. Install runtime and build dependencies
+apt install -y \
+  curl gnupg sudo git python3 python3-pip python3-venv \
+  libpq-dev build-essential python3-dev pkg-config default-libmysqlclient-dev \
+  imagemagick tesseract-ocr tesseract-ocr-eng ghostscript icc-profiles-free \
+  qpdf liblept5 libxml2 libxslt1.1 antiword unpaper poppler-utils \
+  redis-server postgresql postgresql-contrib
+
+# 3. Permit ImageMagick PDF rendering in security policy
+sed -i 's/<policy domain="coder" rights="none" pattern="PDF" \/>/<policy domain="coder" rights="read|write" pattern="PDF" \/>/' /etc/ImageMagick-6/policy.xml
+```
+
+PostgreSQL & Redis Initialization
+Initialize a clean, UTF-8 encoded database cluster using template0:
+
+```
+cd /tmp
+sudo -u postgres psql -c "CREATE USER paperless WITH PASSWORD 'paperless_secure_pwd';"
+sudo -u postgres psql -c "CREATE DATABASE paperless WITH TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE = 'en_US.UTF-8' LC_CTYPE = 'en_US.UTF-8' OWNER = paperless;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE paperless TO paperless;"
+
+# Start and enable Redis
+systemctl enable --now redis-server
+```
+
+Paperless-ngx Core Installation
+
+```
+# 1. Create service account and directory structure
+groupadd -g 1002 backup 2>/dev/null || true
+useradd --system --home-dir /opt/paperless --shell /bin/bash -G backup paperless
+
+mkdir -p /opt/paperless /opt/paperless/data
+chown -R paperless:backup /opt/paperless
+chown -R paperless:backup /mnt/consume /mnt/media /mnt/export
+chmod -R 2775 /mnt/consume /mnt/media /mnt/export
+
+# 2. Virtual environment and release asset download
+cd /opt/paperless
+sudo -u paperless python3 -m venv venv
+sudo -u paperless ./venv/bin/pip install --upgrade pip
+
+PAPERLESS_VER=$(curl -s [https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest](https://api.github.com/repos/paperless-ngx/paperless-ngx/releases/latest) | grep tag_name | cut -d '"' -f 4)
+curl -L -o paperless.tar.xz "[https://github.com/paperless-ngx/paperless-ngx/releases/download/$](https://github.com/paperless-ngx/paperless-ngx/releases/download/$){PAPERLESS_VER}/paperless-ngx-${PAPERLESS_VER}.tar.xz"
+tar -xf paperless.tar.xz -C /opt/paperless --strip-components=1
+rm paperless.tar.xz
+
+# 3. Install Python requirements (includes Granian ASGI server)
+sudo -u paperless ./venv/bin/pip install -r requirements.txt
+
+# 4. Generate configuration file
+cat << 'EOF' > /opt/paperless/paperless.conf
+# Paths
+PAPERLESS_DATA_DIR=/opt/paperless/data
+PAPERLESS_MEDIA_ROOT=/mnt/media
+PAPERLESS_CONSUMPTION_DIR=/mnt/consume
+PAPERLESS_EXPORT_DIR=/mnt/export
+
+# Database
+PAPERLESS_DBENGINE=postgresql
+PAPERLESS_DBHOST=localhost
+PAPERLESS_DBPORT=5432
+PAPERLESS_DBNAME=paperless
+PAPERLESS_DBUSER=paperless
+PAPERLESS_DBPASS=paperless_secure_pwd
+
+# Redis
+PAPERLESS_REDIS=redis://localhost:6379
+
+# Storage Performance Tuning
+PAPERLESS_CONSUMER_POLLING=30
+PAPERLESS_TASK_WORKERS=2
+PAPERLESS_THREADS_PER_WORKER=2
+
+# Network & Host Binding
+PAPERLESS_URL=[http://192.168.1.109:8000](http://192.168.1.109:8000)
+PAPERLESS_ALLOWED_HOSTS=192.168.1.109,localhost,paperless.local
+PAPERLESS_OCR_LANGUAGE=eng
+
+# Generate a unique secret key
+PAPERLESS_SECRET_KEY=change-this-to-a-random-secret-key-32-chars
+EOF
+
+chown paperless:backup /opt/paperless/paperless.conf
+chmod 640 /opt/paperless/paperless.conf
+
+# 5. Run database migrations & initialize administrator
+cd /opt/paperless/src
+sudo -u paperless ../venv/bin/python3 manage.py migrate
+sudo -u paperless ../venv/bin/python3 manage.py createsuperuser
+```
+
+## 4. Systemd Service Architecture
+Paperless operates through four distinct systemd service units inside the Debian container:
+
+1. Web Application Server (paperless-webserver.service)
+Powered by the modern Rust-based ASGI server Granian:
+
+```
+[Unit]
+Description=Paperless Webserver (Granian)
+After=network.target postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=paperless
+Group=backup
+WorkingDirectory=/opt/paperless/src
+ExecStart=/opt/paperless/venv/bin/granian --interface asgi --host 0.0.0.0 --port 8000 --workers 2 paperless.asgi:application
+EnvironmentFile=/opt/paperless/paperless.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+2. Task Queue Worker (paperless-worker.service)
+Handles OCR, thumbnailing, and indexing operations:
+
+```
+[Unit]
+Description=Paperless Celery Worker
+After=network.target postgresql.service redis-server.service paperless-webserver.service
+
+[Service]
+Type=simple
+User=paperless
+Group=backup
+WorkingDirectory=/opt/paperless/src
+ExecStart=/opt/paperless/venv/bin/celery --app paperless worker --loglevel INFO -c 2
+EnvironmentFile=/opt/paperless/paperless.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+3. File Consumer (paperless-consumer.service)
+Monitors the /mnt/consume dataset for incoming documents:
+
+```
+[Unit]
+Description=Paperless Document Consumer
+After=network.target postgresql.service redis-server.service paperless-webserver.service
+
+[Service]
+Type=simple
+User=paperless
+Group=backup
+WorkingDirectory=/opt/paperless/src
+ExecStart=/opt/paperless/venv/bin/python3 manage.py document_consumer
+EnvironmentFile=/opt/paperless/paperless.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+4. Celery Beat Scheduler (paperless-scheduler.service)
+Manages periodic tasks and maintenance jobs:
+
+```
+[Unit]
+Description=Paperless Celery Beat Scheduler
+After=network.target postgresql.service redis-server.service paperless-webserver.service
+
+[Service]
+Type=simple
+User=paperless
+Group=backup
+WorkingDirectory=/opt/paperless/src
+ExecStart=/opt/paperless/venv/bin/celery --app paperless beat --loglevel INFO
+EnvironmentFile=/opt/paperless/paperless.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 ```
